@@ -9,7 +9,7 @@ aws s3 useful command
 chmod +x /usr/local/bin/gs3
 ```
  
-设置补全到 ~/.zshrc
+4. 设置补全到 ~/.zshrc
 ```
 nano ~/.zshrc
 ```

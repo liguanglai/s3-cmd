@@ -13,7 +13,7 @@ chmod +x /usr/local/bin/gs3
 ```
 nano ~/.zshrc
 ```
-编辑：
+在最下面添加：
 
 ```
 # # <<< gs3-completion <<<

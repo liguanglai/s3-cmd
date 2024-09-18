@@ -54,11 +54,28 @@ download() {
     local bucket prefix
     read bucket prefix < <(parse_s3_url "$s3_path")
 
-    echo "Downloading from s3://${bucket}/${prefix}"
-    aws s3 cp "s3://${bucket}/${prefix}" "${full_dest_dir}/" --recursive --profile "$profile"
+    echo "Attempting to download from s3://${bucket}/${prefix}"
 
-    echo "Downloaded to ${full_dest_dir}"
-    open "$full_dest_dir"
+    # 检查是文件还是目录
+    if aws s3 ls "s3://${bucket}/${prefix}" --profile "$profile" | grep -q "PRE"; then
+        # 是目录
+        echo "Detected directory. Downloading all contents."
+        aws s3 cp "s3://${bucket}/${prefix}" "${full_dest_dir}/" --recursive --profile "$profile"
+    else
+        # 是文件
+        echo "Detected single file. Downloading file."
+        local filename=$(basename "$prefix")
+        aws s3 cp "s3://${bucket}/${prefix}" "${full_dest_dir}/${filename}" --profile "$profile"
+    fi
+
+    if [ $? -eq 0 ]; then
+        echo "Successfully downloaded to ${full_dest_dir}"
+        ls -l "${full_dest_dir}"  # 列出下载的文件
+        open "$full_dest_dir"
+    else
+        echo "Error occurred during download." >&2
+        return 1
+    fi
 }
 
 # 主函数
@@ -104,7 +121,9 @@ main() {
         read bucket prefix < <(parse_s3_url "$path")
 
         if [ "$MODE" = "download" ]; then
+            echo "Starting download for: $path"
             download "$path" "$PROFILE"
+            echo "Download process completed for: $path"
         else
             count_lines "$bucket" "$prefix" "$PROFILE"
         fi

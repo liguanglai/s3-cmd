@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 # 函数：解析 S3 URL
 parse_s3_url() {
@@ -17,35 +17,154 @@ count_lines() {
     local prefix=$2
     local profile=$3
 
-    echo "Counting lines in s3://${bucket}/${prefix}/"
-    echo "Using AWS profile: $profile"
-    echo
-
-    echo -e "No.\tFile Name\tLines"
+    echo "Analyzing s3://${bucket}/${prefix}" >&2
+    echo "Using AWS profile: $profile" >&2
+    echo >&2
 
     local total_lines=0
-    local file_count=0
+    local total_file_count=0
+    local paths_processed=0
+    local all_file_details="No.\tFile Name\tLines\n"
 
-    while read -r line; do
-        local file_name=$(echo $line | awk '{print $4}')
-        if [[ ! -z "$file_name" ]]; then
-            ((file_count++))
-            local lines=$(aws s3 cp "s3://${bucket}/${file_name}" - --profile "$profile" 2>/dev/null | wc -l)
-            echo -e "$file_count\t$file_name\t$lines"
-            ((total_lines += lines))
+    # 检查是否包含通配符
+    if [[ $prefix == *"*"* ]]; then
+        local before_wildcard="${prefix%%\**}"
+        local after_wildcard="${prefix#*\*}"
+        local wildcard_pattern="${prefix:${#before_wildcard}:${#prefix}-${#before_wildcard}-${#after_wildcard}}"
+
+        # 列出匹配的前缀
+        echo "Listing prefixes matching wildcard in s3://${bucket}/${before_wildcard}" >&2
+
+        # 使用 aws s3api 和 jq 获取匹配的前缀
+        local matched_dirs
+        matched_dirs=$(aws s3api list-objects-v2 --bucket "$bucket" --prefix "$before_wildcard" --delimiter '/' --profile "$profile" \
+            --query 'CommonPrefixes[].Prefix' --output json | jq -r '.[]')
+
+        if [ -z "$matched_dirs" ]; then
+            echo "No matching prefixes found for wildcard pattern." >&2
+            exit 1
         fi
-    done < <(aws s3 ls "s3://${bucket}/${prefix}/" --recursive --profile "$profile")
 
-    echo -e "\nSummary:"
-    echo -e "Total files processed:\t$file_count"
+        while IFS= read -r matched_dir; do
+            local dir="${matched_dir#$before_wildcard}"
+            dir="${dir%/}"
+
+            # 使用正确的正则表达式进行匹配
+            if [[ "$dir" =~ ${wildcard_pattern//\*/.*} ]]; then
+                local full_path="${before_wildcard}${dir}${after_wildcard}"
+                full_path=$(echo "$full_path" | sed 's|//|/|g')
+                echo -e "\nProcessing: s3://${bucket}/${full_path}" >&2
+
+                # 调用 count_lines_in_prefix 函数，获取文件详细信息
+                per_file_output=$(count_lines_in_prefix "$bucket" "$full_path" "$profile")
+
+                # 提取文件数和总行数
+                file_count=$(echo "$per_file_output" | grep 'FILE_COUNT:' | cut -d':' -f2)
+                path_total_lines=$(echo "$per_file_output" | grep 'TOTAL_LINES:' | cut -d':' -f2)
+                per_file_output=$(echo "$per_file_output" | grep -v 'FILE_COUNT:\|TOTAL_LINES:')
+
+                # 累加文件详细信息
+                all_file_details+="$per_file_output"
+
+                # 累加总文件数和总行数
+                ((total_file_count += file_count))
+                ((total_lines += path_total_lines))
+                ((paths_processed++))
+            fi
+        done <<< "$matched_dirs"
+    else
+        echo "No wildcard in prefix, processing directly." >&2
+        per_file_output=$(count_lines_in_prefix "$bucket" "$prefix" "$profile")
+
+        # 提取文件数和总行数
+        file_count=$(echo "$per_file_output" | grep 'FILE_COUNT:' | cut -d':' -f2)
+        total_lines=$(echo "$per_file_output" | grep 'TOTAL_LINES:' | cut -d':' -f2)
+        per_file_output=$(echo "$per_file_output" | grep -v 'FILE_COUNT:\|TOTAL_LINES:')
+
+        # 累加文件详细信息
+        all_file_details+="$per_file_output"
+
+        total_file_count=$file_count
+        paths_processed=1
+    fi
+
+    # 输出所有文件的详细信息
+    echo -e "$all_file_details"
+
+    # 输出总计
+    echo -e "\nOverall Summary:"
+    echo -e "Total paths processed:\t$paths_processed"
+    echo -e "Total files processed:\t$total_file_count"
     echo -e "Total lines across all files:\t$total_lines"
 }
+
+
+
+
+# 函数：计算指定前缀下文件的行数
+count_lines_in_prefix() {
+    local bucket=$1
+    local prefix=$2
+    local profile=$3
+
+    local file_count=0
+    local total_lines=0
+    local per_file_output=""
+
+    # 去除 prefix 末尾的斜杠
+    prefix="${prefix%/}"
+
+    # 尝试列出以该前缀开头的对象
+    local files
+    files=$(aws s3api list-objects-v2 --bucket "$bucket" --prefix "$prefix" --profile "$profile" \
+        --query 'Contents[].Key' --output json | jq -r '.[]')
+
+    if [ -n "$files" ]; then
+        # 存在以该前缀开头的对象，可能是目录
+        for file_name in $files; do
+            if [[ "$file_name" != */ ]]; then
+                ((file_count++))
+                local relative_name="${file_name#$prefix/}"
+                local lines
+                if lines=$(aws s3 cp "s3://${bucket}/${file_name}" - --profile "$profile" 2>/dev/null | wc -l); then
+                    per_file_output+="${file_count}\t${relative_name}\t${lines}\n"
+                    ((total_lines += lines))
+                else
+                    echo "Error: Failed to process s3://${bucket}/${file_name}" >&2
+                fi
+            fi
+        done
+    else
+        # 尝试将前缀视为单个文件
+        if aws s3api head-object --bucket "$bucket" --key "$prefix" --profile "$profile" >/dev/null 2>&1; then
+            # 前缀是一个文件
+            ((file_count++))
+            local file_name="${prefix##*/}"
+            local lines
+            if lines=$(aws s3 cp "s3://${bucket}/${prefix}" - --profile "$profile" 2>/dev/null | wc -l); then
+                per_file_output+="1\t${file_name}\t${lines}\n"
+                ((total_lines += lines))
+            else
+                echo "Error: Failed to process s3://${bucket}/${prefix}" >&2
+            fi
+        else
+            echo "Error: No objects found at s3://${bucket}/${prefix}" >&2
+        fi
+    fi
+
+    # 将文件详细信息和统计数据返回给调用者
+    echo -e "$per_file_output"
+    echo "FILE_COUNT:${file_count}"
+    echo "TOTAL_LINES:${total_lines}"
+}
+
+
 
 # 函数：下载文件或目录
 download() {
     local s3_path=$1
     local profile=$2
-    local dest_dir="/Users/ligl/Downloads/00.Mac-dls/05.ok_aws3dl"
+    local dest_dir=$3
     local date_dir=$(date +"%Y%m%d")
     local full_dest_dir="${dest_dir}/${date_dir}"
 
@@ -56,22 +175,43 @@ download() {
 
     echo "Attempting to download from s3://${bucket}/${prefix}"
 
-    # 检查是文件还是目录
-    if aws s3 ls "s3://${bucket}/${prefix}" --profile "$profile" | grep -q "PRE"; then
-        # 是目录
-        echo "Detected directory. Downloading all contents."
-        aws s3 cp "s3://${bucket}/${prefix}" "${full_dest_dir}/" --recursive --profile "$profile"
+    # 如果前缀中包含通配符
+    if [[ $prefix == *"*"* ]]; then
+        local before_wildcard="${prefix%%\**}"
+        local after_wildcard="${prefix#*\*}"
+        local wildcard_pattern="${prefix:${#before_wildcard}:${#prefix}-${#before_wildcard}-${#after_wildcard}}"
+
+        # 列出匹配的前缀
+        echo "Listing prefixes matching wildcard in s3://${bucket}/${before_wildcard}"
+        local matched_prefixes
+        IFS=$'\n' read -d '' -r -a matched_prefixes < <(aws s3api list-objects-v2 --bucket "$bucket" --prefix "$before_wildcard" --delimiter '/' --profile "$profile" --query 'CommonPrefixes[].Prefix' --output text | grep -E "${wildcard_pattern//\*/.*}" && printf '\0')
+
+        if [ ${#matched_prefixes[@]} -eq 0 ]; then
+            echo "No matching prefixes found for wildcard pattern."
+            exit 1
+        fi
+
+        for matched_prefix in "${matched_prefixes[@]}"; do
+            local dir_name="${matched_prefix#$before_wildcard}"
+            dir_name="${dir_name%/}"
+
+            if [[ $dir_name =~ ${wildcard_pattern//\*/.*} ]]; then
+                local full_prefix="${matched_prefix}${after_wildcard}"
+                echo "Downloading from s3://${bucket}/${full_prefix}"
+                aws s3 cp "s3://${bucket}/${full_prefix}" "${full_dest_dir}/${dir_name}/" --recursive --profile "$profile"
+                echo "Downloaded to ${full_dest_dir}/${dir_name}/"
+            fi
+        done
     else
-        # 是文件
-        echo "Detected single file. Downloading file."
-        local filename=$(basename "$prefix")
-        aws s3 cp "s3://${bucket}/${prefix}" "${full_dest_dir}/${filename}" --profile "$profile"
+        # 直接下载指定的文件或目录
+        aws s3 cp "s3://${bucket}/${prefix}" "${full_dest_dir}/" --recursive --profile "$profile"
     fi
 
     if [ $? -eq 0 ]; then
         echo "Successfully downloaded to ${full_dest_dir}"
-        ls -l "${full_dest_dir}"  # 列出下载的文件
-        open "$full_dest_dir"
+        ls -lR "${full_dest_dir}"  # 递归列出下载的文件
+        # 根据需要，您可以选择是否打开下载目录
+        # open "$full_dest_dir"  # 仅在 macOS 上有效
     else
         echo "Error occurred during download." >&2
         return 1
@@ -82,6 +222,7 @@ download() {
 main() {
     local PROFILE="default"
     local MODE="count"
+    local OUTPUT_DIR="."
     local PATHS=()
 
     # 解析命令行参数
@@ -97,6 +238,10 @@ main() {
                 ;;
             -p|--profile)
                 PROFILE="$2"
+                shift 2
+                ;;
+            -o|--output)
+                OUTPUT_DIR="$2"
                 shift 2
                 ;;
             *)
@@ -119,10 +264,9 @@ main() {
     for path in "${PATHS[@]}"; do
         local bucket prefix
         read bucket prefix < <(parse_s3_url "$path")
-
         if [ "$MODE" = "download" ]; then
             echo "Starting download for: $path"
-            download "$path" "$PROFILE"
+            download "$path" "$PROFILE" "$OUTPUT_DIR"
             echo "Download process completed for: $path"
         else
             count_lines "$bucket" "$prefix" "$PROFILE"
